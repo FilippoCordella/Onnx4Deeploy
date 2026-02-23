@@ -9,10 +9,12 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
+import onnx 
+from onnx import helper, TensorProto, shape_inference
 
 from ..core.base_exporter import BaseONNXExporter
 from .pytorch_models.mamba import Mamba
-
+from ..core.optimization_passes import RemoveIdentityPass, ShapeInferencePass
 
 class MambaExporter(BaseONNXExporter):
     """
@@ -170,6 +172,120 @@ class MambaExporter(BaseONNXExporter):
         num_classes = self.config["num_classes"]
         return f"_mamba_{d_model}_{n_layers}_{seq_len}_{num_classes}"
 
+    def get_SSM_shapes(self) -> Dict[str, Tuple[int, ...]]:
+        """Get all tensor shapes inside SelectiveSSM operator."""
+        B = self.config["batch_size"]
+        L = self.config["max_seq_len"]
+        D = self.config["d_model"] * self.config["expand_factor"]  # d_inner
+        N = self.config["d_state"]
+        
+        return {
+            # Inputs
+            "x": (B, L, D),
+            "A_log": (D, N),
+            "B": (B, L, N),
+            "C": (B, L, N),
+            "D": (D,),
+            "dt": (B, L, D),
+            "res": (B, L, D),
+            
+            # Intermediates
+            "A": (D, N),                    # Exp(A_log)
+            "x_expanded": (B, L, D, 1),     # Reshape for broadcast
+            "A_expanded": (1, 1, D, N),     # Reshape for broadcast
+            "Ax": (B, L, D, N),             # x * A
+            "B_expanded": (B, L, 1, N),     # Reshape for broadcast
+            "state": (B, L, D, N),          # Ax + B
+            "C_expanded": (B, L, 1, N),     # Reshape for broadcast
+            "state_C": (B, L, D, N),        # state * C
+            "y_sum": (B, L, D),             # ReduceSum over N
+            "D_expanded": (1, 1, D),        # Reshape for broadcast
+            "Dx_dt": (B, L, D),             # D * x * dt
+            "y_skip": (B, L, D),            # y_sum + Dx_dt
+            "res_act": (B, L, D),           # SiLU(res)
+            
+            # Output
+            "y": (B, L, D),
+        }
+
+    def _inject_ssm_value_info(self, onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+        """Inject ValueInfoProto entries for SelectiveSSM inputs/outputs.
+
+        This uses `get_SSM_shapes()` to map expected shapes to the actual
+        input/output names of SelectiveSSM nodes in the graph. It adds
+        conservative type/shape hints so shape inference can propagate
+        through custom-operator boundaries.
+        """
+        graph = onnx_model.graph
+
+        #collect names of all existing ValueInfoProto to avoid duplicates
+        existing = {v.name for v in list(graph.input) + list(graph.value_info) + list(graph.output)}
+
+        # Map from tensor name to element type (TensorProto data type) -> faster access
+        known_elem = {}
+        for value_info in list(graph.input) + list(graph.value_info) + list(graph.output):
+            tensor_type = value_info.type.tensor_type if value_info.type else None
+            if tensor_type and tensor_type.elem_type:
+                known_elem[value_info.name] = tensor_type.elem_type
+        
+        #Also initializers constant tensors might be useful
+        for initializer in graph.initializer:
+            known_elem.setdefault(initializer.name, initializer.data_type)
+
+        def _find_elem_type(name: str):
+            return known_elem.get(name, TensorProto.FLOAT) #Default must be changed
+
+        shapes = self.get_SSM_shapes()
+        input_keys = ["x", "A_log", "B", "C", "D", "dt", "res"]
+
+        for node in graph.node:
+            if node.op_type == "SelectiveSSM" and node.domain == "ai.mamba":
+    
+                for inp_name, key in zip(node.input, input_keys):
+                    shape = shapes.get(key)  #Expected shape for this input
+                    if shape is None or inp_name in existing:
+                        continue
+
+                    #Create ValueInfoProto with conservative element type and expected shape
+                    value_info = helper.make_tensor_value_info(inp_name, _find_elem_type(inp_name), list(shape))
+                    
+                    #Append value info to graph
+                    graph.value_info.append(value_info)
+
+                    #Update existing names and known element types
+                    existing.add(inp_name)
+                    known_elem[inp_name] = _find_elem_type(inp_name)
+                
+                #one outhput with expected shape
+                if node.output and "y" in shapes:
+                    out_name = node.output[0]
+                    if out_name not in existing:
+                        elem_type = _find_elem_type(node.input[0]) if node.input else TensorProto.FLOAT
+
+                        #Create ValueInfoProto with conservative element type and expected shape for output
+                        value_info = helper.make_tensor_value_info(out_name, elem_type, list(shapes["y"]))
+                        graph.value_info.append(value_info)
+
+                        existing.add(out_name)
+                        known_elem[out_name] = elem_type
+
+        return onnx_model
+
+    #for memory-aware t
+    def _inject_ssm_intermidiate_value_info(self, onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+        """Inject ValueInfoProto entries for SelectiveSSM intermediate tensors.
+
+        This is an optional step that adds ValueInfoProto entries for
+        intermediate tensors inside the SelectiveSSM operator. This can
+        help with debugging and visualization, but is not strictly necessary
+        for inference optimization.
+        """
+        """This is a placeholder for future implementation if we want to add more detailed value 
+        info for intermediate tensors inside the SelectiveSSM operator. 
+        IDEA: intermediate tensors as metadata inside .json"""
+        
+        return onnx_model
+
     def _export_to_onnx(
         self, model: torch.nn.Module, input_tensor: torch.Tensor, opset_version: int = 17
     ):
@@ -206,9 +322,11 @@ class MambaExporter(BaseONNXExporter):
             export_params=True,
             keep_initializers_as_inputs=False,
             custom_opsets={"ai.mamba": 1},  # Custom operator domain
+            dynamo=False,  # Disable Dynamo for cleaner export
         )
 
         onnx_model = onnx.load_model_from_string(f.getvalue())
+        onnx_model = self._inject_ssm_value_info(onnx_model)
 
         # Print export summary
         print("\n✨ ONNX Export Complete:")
@@ -231,6 +349,8 @@ class MambaExporter(BaseONNXExporter):
         that might unfold or remove the SelectiveSSM custom operator.
         """
         print("   ⏭️  Skipping graph optimizations (preserving custom operators)")
+        RemoveIdentityPass().apply(onnx_file, output_file, {})
+        ShapeInferencePass().apply(output_file, output_file, {})
 
         if onnx_file != output_file:
             import shutil

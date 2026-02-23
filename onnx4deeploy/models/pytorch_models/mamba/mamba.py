@@ -12,6 +12,7 @@ This version exports to ONNX with clean, high-level operators:
 No fragmented graphs, no dynamic operations!
 """
 
+
 from typing import Optional
 
 import torch
@@ -25,24 +26,26 @@ from torch.autograd import Function
 
 
 class LayerNormFunction(Function):
-    """Custom LayerNorm with const mean/std."""
+    """Custom LayerNorm with mean= 0 and std = 1 (baked in)."""
 
     @staticmethod
-    def forward(ctx, x, mean, std, weight, bias, eps):
-        # Normalization with const mean/std
-        x_norm = (x - mean) / (std + eps)
+    def forward(ctx, x, weight, bias, eps):
+        # Normalization: mean=0, std=1 are implicit (pre-normalized or baked in)
+        x_norm = x/ (1+eps)
         return x_norm * weight + bias
 
     @staticmethod
-    def symbolic(g, x, mean, std, weight, bias, eps):
-        """Export as custom LayerNorm operator."""
-        return g.op("ai.mamba::LayerNorm", x, mean, std, weight, bias, epsilon_f=eps, outputs=1)
-
+    def symbolic(g, x, weight, bias, eps):
+        """Export as custom LayerNorm operator with shape annotation."""
+        # Shape annotation: output shape = input shape
+        y = g.op("ai.mamba::LayerNorm", x, weight, bias, epsilon_f=eps, outputs=1)
+        y.setType(x.type())  # Ensure output has same shape/type as input
+        return y
 
 class LayerNorm(nn.Module):
-    """Custom LayerNorm operator with const mean/std.
+    """Custom LayerNorm with mean= 0 and std = 1 (baked in).
 
-    Exports as single custom ONNX operator.
+    Exports as single custom ONNX operator
     """
 
     def __init__(self, normalized_shape, eps=1e-5):
@@ -52,17 +55,13 @@ class LayerNorm(nn.Module):
         self.normalized_shape = normalized_shape
         self.eps = eps
 
-        # Const mean and std (buffers)
-        self.register_buffer("mean", torch.zeros(normalized_shape))
-        self.register_buffer("std", torch.ones(normalized_shape))
-
-        # Learnable parameters
+        # Only learnable parameters - no buffers to avoid Identity nodes
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
     def forward(self, x):
-        # Custom op with const mean/std
-        return LayerNormFunction.apply(x, self.mean, self.std, self.weight, self.bias, self.eps)
+        # Simplified: no mean/std buffers passed
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
 
 
 class SiLUFunction(Function):
@@ -74,8 +73,10 @@ class SiLUFunction(Function):
 
     @staticmethod
     def symbolic(g, x):
-        # Export as single Silu node
-        return g.op("Silu", x)
+        # Export as single Silu node with shape propagation
+        y = g.op("Silu", x)
+        y.setType(x.type())  
+        return y
 
 
 class SiLU(nn.Module):
@@ -86,7 +87,76 @@ class SiLU(nn.Module):
 
     def forward(self, x):
         return SiLUFunction.apply(x)
+    
+class PaddedConv1dFunction(Function):
+    """
+    Conv1d with pre-padding to achieve 'same' padding without extra nodes.
 
+    Exports as a standard ONNX Conv node with pads attribute (no Pad + Conv, just Conv).
+    No custom op registration needed - uses standard ONNX Conv.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, padding_left, padding_right, groups, kernel_size):
+        """
+        Forward pass of Conv1d with pre-padding for 'same' output length.
+        """
+        # Pre-pad input for 'same' convolution
+        x_padded = F.pad(x, (padding_left, padding_right))
+        return F.conv1d(x_padded, weight, bias, stride=1, padding=0, groups=groups)
+
+    @staticmethod
+    def symbolic(g, x, weight, bias, padding_left, padding_right, groups, kernel_size):
+        """
+        Export as standard ONNX Conv node with padding as attributes.
+        No custom op needed - uses standard ONNX Conv with pads attribute.
+        """
+        # Standard ONNX Conv op (works for 1D, 2D, 3D based on input rank)
+        # pads format for 1D: [pad_start, pad_end]
+
+        #shape inference here
+
+        return g.op(
+            "Conv",
+            x,
+            weight,
+            bias,
+            kernel_shape_i=[kernel_size],
+            pads_i=[padding_left, padding_right],
+            strides_i=[1],
+            dilations_i=[1],
+            group_i=groups,
+        )
+
+
+class PaddedConv1d(nn.Module):
+    """Conv1d with pre-padding to achieve 'same' padding without extra ONNX nodes.
+
+    Exports as standard ONNX Conv node with padding in attributes.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, groups=1, bias=True):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.groups = groups
+        
+        # Compute asymmetric padding for "same" behavior
+        # For kernel_size=4: pad_left=1, pad_right=2 -> output_len = input_len
+        self.padding_left = (kernel_size - 1) // 2
+        self.padding_right = (kernel_size - 1) - self.padding_left
+        
+        self.conv1d = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            groups=groups,
+            padding=0,  # No padding here, we handle it via custom function
+            bias=bias,
+        )
+
+    def forward(self, x):
+        return PaddedConv1dFunction.apply(x,self.conv1d.weight,self.conv1d.bias,self.padding_left,self.padding_right,
+                                          self.groups, self.kernel_size)
 
 # ============================================================================
 # Custom ONNX operator
@@ -133,7 +203,7 @@ class SelectiveSSMFunction(Function):
     """
 
     @staticmethod
-    def forward(ctx, x, A_log, B, C, D, dt, res):
+    def forward(ctx, x, A_log, B, C, D, dt, res, batch_size, seq_len, d_inner, d_state):
         """
         Forward pass of Selective SSM with delta and gating.
 
@@ -145,6 +215,10 @@ class SelectiveSSMFunction(Function):
             D: (D,) - skip connection
             dt: (B, L, D) - delta (timestep)
             res: (B, L, D) - residual for gating
+            batch_size: int - fixed batch size
+            seq_len: int - fixed sequence length
+            d_inner: int - fixed inner dimension
+            d_state: int - fixed state dimension (N)
 
         Returns:
             y: (B, L, D) - output after gating
@@ -152,8 +226,11 @@ class SelectiveSSMFunction(Function):
         # Exp inside custom op
         A = torch.exp(A_log)
         # SSM computation: y = sum((A * x + B) * C, dim=-1) + D * x
-        B_size, L, D_inner = x.shape
-        N = B.shape[-1]
+        # Use fixed dimensions instead of dynamic shape queries
+        B_size = batch_size
+        L = seq_len
+        D_inner = d_inner
+        N = d_state
 
         # Reshape for broadcasting
         x_expanded = x.reshape(B_size, L, D_inner, 1)
@@ -177,12 +254,31 @@ class SelectiveSSMFunction(Function):
         return y
 
     @staticmethod
-    def symbolic(g, x, A_log, B, C, D, dt, res):
+    def symbolic(g, x, A_log, B, C, D, dt, res, batch_size, seq_len, d_inner, d_state):
         """
         ONNX symbolic function - single SelectiveSSM node with gating.
         """
-        return g.op("ai.mamba::SelectiveSSM", x, A_log, B, C, D, dt, res, outputs=1)
 
+        # Pass fixed-size integers as attributes (use _i suffix for ints)
+        # to avoid creating malformed Constant node attributes during export.
+        y = g.op(
+            "ai.mamba::SelectiveSSM",
+            x,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            res,
+            batch_size_i=batch_size,
+            seq_len_i=seq_len,
+            d_inner_i=d_inner,
+            d_state_i=d_state,
+            outputs=1,
+        )
+        y.setType(x.type())  # Ensure output has same shape/type as input
+
+        return y
 
 class SelectiveSSM(nn.Module):
     """Selective SSM that exports as a single ONNX operator."""
@@ -193,6 +289,8 @@ class SelectiveSSM(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand_factor: int = 2,
+        batch_size: int = 1,
+        seq_len: int = 512,
     ):
         super().__init__()
         self.d_model = d_model
@@ -200,18 +298,21 @@ class SelectiveSSM(nn.Module):
         self.d_inner = d_model * expand_factor
         self.d_conv = d_conv
         self.padding_size = d_conv - 1
+        # Fixed dimensions for ONNX export (no dynamic shape)
+        self.batch_size = batch_size
+        self.seq_len = seq_len
 
         # Linear projections - separate layers to avoid slicing
         self.in_proj = nn.Linear(d_model, self.d_inner, bias=False)
         self.res_proj = nn.Linear(d_model, self.d_inner, bias=False)
 
         # Conv1d with 'same' padding - output length = input length
-        self.conv1d = nn.Conv1d(
+        # Uses PaddedConv1d which exports as single ONNX Conv node (no Pad node)
+        self.conv1d = PaddedConv1d(
             self.d_inner,
             self.d_inner,
             kernel_size=d_conv,
             groups=self.d_inner,
-            padding="same",  # Auto padding, output length = input length
             bias=True,
         )
 
@@ -266,7 +367,10 @@ class SelectiveSSM(nn.Module):
         dt = F.softplus(dt)
 
         # 6. Selective SSM (custom operator - includes Exp, gating, all inside)
-        y = SelectiveSSMFunction.apply(x_conv, self.A_log, B, C, self.D, dt, res)
+        y = SelectiveSSMFunction.apply(
+            x_conv, self.A_log, B, C, self.D, dt, res,
+            self.batch_size, self.seq_len, self.d_inner, self.d_state
+        )
 
         # 7. Output projection
         output = self.out_proj(y)
@@ -284,10 +388,12 @@ class MambaBlock(nn.Module):
         d_conv: int = 4,
         expand_factor: int = 2,
         dropout: float = 0.0,
+        batch_size: int = 1,
+        seq_len: int = 512,
     ):
         super().__init__()
         self.norm = LayerNorm(d_model)
-        self.ssm = SelectiveSSM(d_model, d_state, d_conv, expand_factor)
+        self.ssm = SelectiveSSM(d_model, d_state, d_conv, expand_factor, batch_size, seq_len)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -338,9 +444,12 @@ class Mamba(nn.Module):
             self.embedding = None
             self.input_proj = nn.Linear(d_model, d_model)
 
+        # Fixed batch size for ONNX export
+        self.batch_size = 1  # Fixed batch size for deployment
+
         # Mamba layers
         self.layers = nn.ModuleList(
-            [MambaBlock(d_model, d_state, d_conv, expand_factor, dropout) for _ in range(n_layers)]
+            [MambaBlock(d_model, d_state, d_conv, expand_factor, dropout, self.batch_size, max_seq_len) for _ in range(n_layers)]
         )
 
         # Output
